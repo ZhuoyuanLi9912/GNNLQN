@@ -118,10 +118,24 @@ class LQNGNN(torch.nn.Module):
         queue_lengths = self.entry_predictor(entry_x)
 
         # Ensure positive predictions
-        queue_lengths = torch.relu(queue_lengths)
+        queue_lengths = self.activation(queue_lengths)
 
         return queue_lengths
 
+
+def mape_loss(predictions, targets, epsilon=1e-8):
+    """
+    Computes the Mean Absolute Percentage Error (MAPE) loss.
+
+    Args:
+        predictions (torch.Tensor): Predicted values.
+        targets (torch.Tensor): Ground truth values.
+        epsilon (float): Small constant to avoid division by zero.
+
+    Returns:
+        torch.Tensor: MAPE loss.
+    """
+    return torch.mean(torch.abs(targets - predictions) / (torch.abs(targets) + epsilon))
 
 
 def compute_average_relative_error(predictions, labels):
@@ -147,8 +161,10 @@ def train_model(file_path, num_epochs=50, hidden_channels=32, edge_attr_dim=4, l
     # Initialize the model
     model = LQNGNN(hidden_channels, out_channels=1, edge_attr_dim=edge_attr_dim, num_iterations=2).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = torch.nn.MSELoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    criterion = mape_loss  # Using MAPE as the loss function
 
+    best_val_loss = float('inf')  # Keep track of the best validation loss
     for epoch in range(num_epochs):
         # Training phase
         model.train()
@@ -180,9 +196,21 @@ def train_model(file_path, num_epochs=50, hidden_channels=32, edge_attr_dim=4, l
         val_loss /= len(val_loader)
         val_are /= len(val_loader)
 
-        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss: {train_loss:.4f}, Train ARE: {train_are:.4f}, "
-              f"Val Loss: {val_loss:.4f}, Val ARE: {val_are:.4f}")
+        # Adjust learning rate based on validation loss
+        scheduler.step(val_loss)
 
+        # Log the current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch + 1}/{num_epochs}, Train Loss (MAPE): {train_loss:.4f}, Train ARE: {train_are:.4f}, "
+              f"Val Loss (MAPE): {val_loss:.4f}, Val ARE: {val_are:.4f}, Learning Rate: {current_lr:.6f}")
+
+        # Save the best model
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), "best_model.pth")
+            print(f"New best model saved with validation loss: {best_val_loss:.4f}")
+
+    print("Training completed!")
     return model, test_loader
 
 
@@ -190,24 +218,24 @@ def test_model(model, test_loader, device='cuda'):
     model.eval()
     test_loss = 0
     test_are = 0
-    criterion = torch.nn.MSELoss()
     with torch.no_grad():
         for batch in test_loader:
             batch = batch.to(device)
             predictions = model(batch)
-            test_loss += criterion(predictions, batch['entry'].y).item()
+            test_loss += mape_loss(predictions, batch['entry'].y).item()
             test_are += compute_average_relative_error(predictions, batch['entry'].y)
     test_loss /= len(test_loader)
     test_are /= len(test_loader)
 
-    print(f"Test Loss: {test_loss:.4f}, Test ARE: {test_are:.4f}")
+    print(f"Test Loss (MAPE): {test_loss:.4f}, Test ARE: {test_are:.4f}")
+
 
 
 
 
 def main():
     # File path to your dataset
-    file_path = r"C:\PhD\line_2024\LQN_GNN_data_collection\test.mat" # Replace with the actual path to your .mat dataset
+    file_path = r"C:\PhD\line_2024\test_overall.mat" # Replace with the actual path to your .mat dataset
 
     # Hyperparameters
     num_epochs = 50
