@@ -1,20 +1,114 @@
 import torch
 from scipy.io import loadmat
 from torch_geometric.data import HeteroData
+from sklearn.preprocessing import MinMaxScaler
 
 
 def load_lqn_dataset(file_path, device='cuda'):
     """
     Loads the LQN dataset from a .mat file, converts all graphs to PyTorch Geometric format,
-    and normalizes the data.
+    and applies global normalization to node and edge attributes, including labels.
     """
     mat_data = loadmat(file_path)
     LQN_dataset = mat_data['LQN_dataset']
 
-    # Iterate through all cells in the 20000x1 dataset
+    # Initialize lists to collect all attributes globally
+    processor_attributes = []
+    task_attributes = []
+    entry_attributes = []
+    edge_attributes = []
+    labels = []  # Collect labels (entry_throughputs)
+
+    # Step 1: Collect attributes and labels from all graphs
+    for i in range(LQN_dataset.shape[0]):
+        LQN_graph = LQN_dataset[i][0]
+        fields = LQN_graph.dtype.names
+
+        # Collect processor node attributes
+        if 'processor_attributes' in fields:
+            processor_attributes.append(
+                torch.tensor(LQN_graph['processor_attributes'][0][0], dtype=torch.float)
+            )
+        # Collect task node attributes
+        if 'task_attributes' in fields:
+            task_attributes.append(
+                torch.tensor(LQN_graph['task_attributes'][0][0], dtype=torch.float)
+            )
+        # Collect entry node attributes
+        if 'entry_attributes' in fields:
+            entry_attributes.append(
+                torch.tensor(LQN_graph['entry_attributes'][0][0], dtype=torch.float)
+            )
+        # Collect edge attributes
+        if 'entry_call_entry_edge_attributes' in fields:
+            edge_attributes.append(
+                torch.tensor(LQN_graph['entry_call_entry_edge_attributes'][0][0], dtype=torch.float)
+            )
+        # Collect labels (entry queue lengths)
+        if 'entry_throughputs' in fields:
+            labels.append(
+                torch.tensor(LQN_graph['entry_throughputs'][0][0], dtype=torch.float)
+            )
+
+    # Concatenate all attributes and labels for global normalization
+    processor_attributes = torch.cat(processor_attributes, dim=0)
+    task_attributes = torch.cat(task_attributes, dim=0)
+    entry_attributes = torch.cat(entry_attributes, dim=0)
+    edge_attributes = torch.cat(edge_attributes, dim=0)
+    labels = torch.cat(labels, dim=0)
+
+    # Apply Min-Max normalization globally
+    processor_scaler = MinMaxScaler()
+    task_scaler = MinMaxScaler()
+    entry_scaler = MinMaxScaler()
+    edge_scaler = MinMaxScaler()
+    label_scaler = MinMaxScaler()
+
+    normalized_processor_attributes = torch.tensor(
+        processor_scaler.fit_transform(processor_attributes.numpy()), dtype=torch.float, device=device
+    )
+    normalized_task_attributes = torch.tensor(
+        task_scaler.fit_transform(task_attributes.numpy()), dtype=torch.float, device=device
+    )
+    normalized_entry_attributes = torch.tensor(
+        entry_scaler.fit_transform(entry_attributes.numpy()), dtype=torch.float, device=device
+    )
+    normalized_edge_attributes = torch.tensor(
+        edge_scaler.fit_transform(edge_attributes.numpy()), dtype=torch.float, device=device
+    )
+    normalized_labels = torch.tensor(
+        label_scaler.fit_transform(labels.numpy()), dtype=torch.float, device=device
+    )
+
+    # Step 2: Reassign normalized attributes and labels back to graphs
+    normalized_processor_index = 0
+    normalized_task_index = 0
+    normalized_entry_index = 0
+    normalized_edge_index = 0
+    normalized_label_index = 0
+
     graphs = []
-    for i in range(LQN_dataset.shape[0]):  # Iterate over all 20,000 rows
-        graph = convert_lqn_to_hetero_data(LQN_dataset[i][0], device)
+    for i in range(LQN_dataset.shape[0]):
+        LQN_graph = LQN_dataset[i][0]
+        graph = convert_lqn_to_hetero_data(
+            LQN_graph, device,
+            normalized_processor_attributes[normalized_processor_index:normalized_processor_index +
+                                           LQN_graph['processor_attributes'][0][0].shape[0]],
+            normalized_task_attributes[normalized_task_index:normalized_task_index +
+                                       LQN_graph['task_attributes'][0][0].shape[0]],
+            normalized_entry_attributes[normalized_entry_index:normalized_entry_index +
+                                        LQN_graph['entry_attributes'][0][0].shape[0]],
+            normalized_edge_attributes[normalized_edge_index:normalized_edge_index +
+                                       LQN_graph['entry_call_entry_edge_attributes'][0][0].shape[0]],
+            normalized_labels[normalized_label_index:normalized_label_index +
+                              LQN_graph['entry_throughputs'][0][0].shape[0]]
+        )
+        normalized_processor_index += LQN_graph['processor_attributes'][0][0].shape[0]
+        normalized_task_index += LQN_graph['task_attributes'][0][0].shape[0]
+        normalized_entry_index += LQN_graph['entry_attributes'][0][0].shape[0]
+        normalized_edge_index += LQN_graph['entry_call_entry_edge_attributes'][0][0].shape[0]
+        normalized_label_index += LQN_graph['entry_throughputs'][0][0].shape[0]
+
         graphs.append(graph)
 
     return graphs
@@ -33,50 +127,24 @@ def adjust_edge_index(edge_index):
     return edge_index - 1
 
 
-
-
-def normalize_attributes(data, feature_range=(0, 1)):
+def convert_lqn_to_hetero_data(LQN_graph, device, processor_norm, task_norm, entry_norm, edge_norm, label_norm):
     """
-    Applies Min-Max normalization to each attribute (column) of the data independently.
-
-    Args:
-        data (torch.Tensor): A tensor of shape [num_samples, num_attributes].
-        feature_range (tuple): Desired range of transformed data (default is (0, 1)).
-
-    Returns:
-        torch.Tensor: Min-Max normalized tensor with the same shape as input.
-    """
-    min_val = data.min(dim=0, keepdim=True).values
-    max_val = data.max(dim=0, keepdim=True).values
-    scale = feature_range[1] - feature_range[0]
-    min_range = feature_range[0]
-    # Avoid division by zero for constant features
-    denom = max_val - min_val
-    denom[denom == 0] = 1.0  # Avoid division by zero
-    return (data - min_val) / denom * scale + min_range
-
-
-def convert_lqn_to_hetero_data(LQN_graph, device='cuda'):
-    """
-    Converts a single LQN graph structure to a PyTorch Geometric HeteroData object.
+    Converts a single LQN graph structure to a PyTorch Geometric HeteroData object with globally normalized attributes and labels.
     """
     data = HeteroData()
 
     # Extract field names from the structured array
     fields = LQN_graph.dtype.names
 
-    # Normalize node attributes
+    # Assign normalized node attributes
     if 'processor_attributes' in fields:
-        data['processor'].x = normalize_attributes(
-            torch.tensor(LQN_graph['processor_attributes'][0][0], dtype=torch.float, device=device))
+        data['processor'].x = processor_norm
     if 'task_attributes' in fields:
-        data['task'].x = normalize_attributes(
-            torch.tensor(LQN_graph['task_attributes'][0][0], dtype=torch.float, device=device))
+        data['task'].x = task_norm
     if 'entry_attributes' in fields:
-        data['entry'].x = normalize_attributes(
-            torch.tensor(LQN_graph['entry_attributes'][0][0], dtype=torch.float, device=device))
+        data['entry'].x = entry_norm
 
-    # Edge indices (adjusted with a function)
+    # Assign edge indices (adjusted with a function)
     if 'task_on_processor_edges' in fields:
         data['task', 'on', 'processor'].edge_index = adjust_edge_index(
             torch.tensor(LQN_graph['task_on_processor_edges'][0][0], dtype=torch.long, device=device))
@@ -87,17 +155,16 @@ def convert_lqn_to_hetero_data(LQN_graph, device='cuda'):
         data['entry', 'calls', 'entry'].edge_index = adjust_edge_index(
             torch.tensor(LQN_graph['entry_call_entry_edges'][0][0], dtype=torch.long, device=device))
 
-    # Edge attributes
+    # Assign normalized edge attributes
     if 'entry_call_entry_edge_attributes' in fields:
-        data['entry', 'calls', 'entry'].edge_attr = normalize_attributes(
-            torch.tensor(LQN_graph['entry_call_entry_edge_attributes'][0][0], dtype=torch.float, device=device))
+        data['entry', 'calls', 'entry'].edge_attr = edge_norm
 
-    # Labels
-    if 'entry_queue_lengths' in fields:
-        data['entry'].y = normalize_attributes(
-            torch.tensor(LQN_graph['entry_queue_lengths'][0][0], dtype=torch.float, device=device))
+    # Assign normalized labels
+    if 'entry_throughputs' in fields:
+        data['entry'].y = label_norm
 
     return data
+
 
 def convert_lqn_to_hetero_data_test(LQN_graph, device='cuda'):
     """
@@ -132,8 +199,8 @@ def convert_lqn_to_hetero_data_test(LQN_graph, device='cuda'):
         data['entry', 'calls', 'entry'].edge_attr = torch.tensor(LQN_graph['entry_call_entry_edge_attributes'][0][0], dtype=torch.float, device=device)
 
     # Labels
-    if 'entry_queue_lengths' in fields:
-        data['entry'].y = torch.tensor(LQN_graph['entry_queue_lengths'][0][0], dtype=torch.float, device=device)
+    if 'entry_throughputs' in fields:
+        data['entry'].y = torch.tensor(LQN_graph['entry_throughputs'][0][0], dtype=torch.float, device=device)
 
     return data
 
